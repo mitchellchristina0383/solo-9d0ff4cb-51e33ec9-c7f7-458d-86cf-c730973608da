@@ -10,14 +10,24 @@
   <main class="container">
     <h1>流式故障切换网关演示</h1>
     <p class="subtitle">
-      首节点中途超时后，备用节点用「原提示词 + 网关已采纳词元」续写；
-      网关只追加新词元、忽略迟到回包，整条回复共用一个词元上限。
+      公共上下文可提前送到两台节点预热（各节点只保留最近一次预热结果）；生成与主备接续
+      都以提交时的完整输入（上下文 + 问题）为准，命中复用已算上下文，未命中按原文重算，
+      两种方式产出的词元逐位一致。
     </p>
 
     <section class="panel">
       <form id="chat-form">
         <label>
-          提示词
+          公共上下文（同一份资料可反复提问，先预热再生成可命中缓存）
+          <textarea id="context" rows="3" maxlength="2000"
+            placeholder="（可选）多次提问共用的资料，例如同一段文档">《项目纪要》第三季度网关改造完成，两个推理节点互为主备，词元上限统一由网关管理。</textarea>
+        </label>
+        <div class="row">
+          <button type="button" id="preheat-btn" class="secondary">预热上下文到两台节点</button>
+          <span id="cache-status" class="cache-status">缓存状态未知</span>
+        </div>
+        <label>
+          本次问题
           <input id="prompt" type="text" value="请写一段关于秋天的短文" required maxlength="1000" />
         </label>
         <div class="row">
@@ -47,6 +57,7 @@
         <span id="counter">已采纳词元：0</span>
         <span id="shares"></span>
       </div>
+      <div id="cache-hits" class="cache-hits"></div>
       <div id="verification" class="verification hidden"></div>
     </section>
 
@@ -58,9 +69,15 @@
         <li><b>failover_backup_error</b>：首节点超时，备用节点续写途中失败 —— 保留已显示文本并标记未完成。</li>
         <li><b>version_mismatch</b>：首节点超时，备用节点模型/分词器版本不一致 —— 不接续，保留已显示文本并标记未完成。</li>
       </ul>
+      <ul class="legend">
+        <li><b>预热</b>：把公共上下文提前送到 node-a 与 node-b，各节点只保留最近一次成功预热的结果（新预热会替换旧的，重启即丢失）。</li>
+        <li><b>命中显示</b>：生成时按实际参与的节点显示「缓存命中 / 未命中重算」；无论命中与否，词元序列都与直接计算逐位一致。可以开两个标签页交错预热与生成来验证。</li>
+      </ul>
       <p class="legend">
         词元颜色：<span class="chip node-a">node-a（首节点）</span>
         <span class="chip node-b">node-b（备用节点）</span>
+        命中标记：<span class="cache-chip hit">命中</span>
+        <span class="cache-chip miss">重算</span>
       </p>
     </section>
   </main>

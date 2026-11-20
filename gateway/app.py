@@ -13,6 +13,21 @@ Responsibilities:
   ``max_tokens - accepted_count``.
 * Refuse failover (keep displayed text, mark incomplete) when the two nodes
   report different model/tokenizer identities, or when the backup fails.
+
+Shared-context preheating:
+
+* The page submits the common ``context`` and the per-request question
+  separately; the gateway joins them (``context + prompt``) and THAT complete
+  input is authoritative for both the primary attempt and any backup
+  continuation.
+* ``POST /api/preheat`` fans the same context out to both mock nodes so each
+  can pre-compute its (simulated) context state ahead of time. Each node
+  keeps only its most recent successful preheat.
+* Each node's stream meta reports whether the context computation was reused
+  (cache hit) or recomputed from the original text (miss: no entry, replaced
+  entry, or restart). The gateway forwards a ``cache`` event per participating
+  node and summarizes hits in ``done``/``incomplete``. Tokens are a pure
+  function of the complete input, so hits and misses decode identically.
 """
 from __future__ import annotations
 
@@ -101,6 +116,14 @@ class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=1000)
     max_tokens: int = Field(ge=1, le=128)
     scenario: str = "healthy"
+    # Common material shared across questions. The complete input is
+    # ``context + prompt``; the context part alone is eligible for the
+    # nodes' preheat caches.
+    context: str = Field(default="", max_length=2000)
+
+
+class PreheatRequest(BaseModel):
+    context: str = Field(min_length=1, max_length=2000)
 
 
 def sse(event: str, data: dict) -> bytes:
@@ -157,6 +180,54 @@ def create_app(
         ids = expected_token_ids(prompt, 0, max_tokens)
         return {"ids": ids, "texts": [token_text(prompt, i) for i in range(max_tokens)]}
 
+    @app.post("/api/preheat")
+    async def preheat(body: PreheatRequest) -> dict:
+        """Send the same context to both nodes so each pre-computes its
+        context state ahead of the next question. Each node keeps only its
+        most recent successful preheat."""
+        results: dict[str, dict] = {}
+
+        async def warm(name: str, url: str) -> None:
+            try:
+                async with make_client(url) as client:
+                    resp = await client.post("/preheat", json={"context": body.context})
+                    if resp.status_code == 200:
+                        results[name] = {"ok": True, **resp.json()}
+                    else:
+                        results[name] = {"ok": False, "error": f"http_{resp.status_code}"}
+            except httpx.HTTPError as exc:
+                results[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        await asyncio.gather(
+            warm(cfg.primary_name, cfg.node_a_url),
+            warm(cfg.backup_name, cfg.node_b_url),
+        )
+        return {
+            "context_len": len(body.context),
+            "ok": all(r.get("ok") for r in results.values()),
+            "results": results,
+        }
+
+    @app.get("/api/cache")
+    async def cache_status() -> dict:
+        """Aggregate both nodes' single-slot prefix-cache state."""
+        results: dict[str, dict] = {}
+
+        async def probe(name: str, url: str) -> None:
+            try:
+                async with make_client(url) as client:
+                    resp = await client.get("/cache")
+                    resp.raise_for_status()
+                    results[name] = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                results[name] = {"ok": False, "error": str(exc)}
+
+        await asyncio.gather(
+            probe(cfg.primary_name, cfg.node_a_url),
+            probe(cfg.backup_name, cfg.node_b_url),
+        )
+        return {"nodes": results}
+
     @app.post("/api/chat")
     async def chat(body: ChatRequest) -> StreamingResponse:
         if body.scenario not in SCENARIOS:
@@ -187,11 +258,16 @@ async def _orchestrate(
     cfg: GatewayConfig,
     make_client: Callable[[str], httpx.AsyncClient],
 ) -> AsyncIterator[bytes]:
-    prompt, max_tokens = body.prompt, body.max_tokens
+    # The complete input at submission time is authoritative for both the
+    # primary attempt and any backup continuation.
+    prompt = body.context + body.prompt
+    context = body.context
+    max_tokens = body.max_tokens
     accepted_ids: list[int] = []
     accepted_texts: list[str] = []
     provenance: list[str] = []
     primary_identity: tuple[str, str] | None = None
+    cache_report: dict[str, bool] = {}
     next_index = 0
 
     yield sse("meta", {
@@ -200,6 +276,7 @@ async def _orchestrate(
         "max_tokens": max_tokens,
         "primary": cfg.primary_name,
         "backup": cfg.backup_name,
+        "context_len": len(context),
     })
 
     def accept_token(obj: dict, node: str) -> bool:
@@ -218,11 +295,25 @@ async def _orchestrate(
         next_index += 1
         return True
 
+    def note_cache_event(info: dict, node: str) -> dict | None:
+        """Build a browser-facing cache event from a node's stream meta."""
+        if not context:
+            return None
+        hit = bool(info.get("cache_hit"))
+        cache_report[node] = hit
+        return {
+            "node": node,
+            "cache_hit": hit,
+            "context_state": info.get("context_state"),
+            "context_len": len(context),
+        }
+
     # ---- primary node ------------------------------------------------------
     primary_fault = faults["primary"]
     primary_payload = {
         "request_id": request_id,
         "prompt": prompt,
+        "context": context,
         "start": 0,
         "max_tokens": max_tokens,
         "accepted_ids": [],
@@ -258,6 +349,9 @@ async def _orchestrate(
                         if event == "meta":
                             info = json.loads(data)
                             primary_identity = (info["model_id"], info["tokenizer_version"])
+                            cache_event = note_cache_event(info, cfg.primary_name)
+                            if cache_event is not None:
+                                yield sse("cache", cache_event)
                         elif event == "token":
                             obj = json.loads(data)
                             if accept_token(obj, cfg.primary_name):
@@ -278,6 +372,7 @@ async def _orchestrate(
         yield sse("done", {
             "reason": "max_tokens", "token_count": next_index,
             "nodes": _node_shares(provenance),
+            "cache": cache_report,
         })
         return
 
@@ -289,6 +384,7 @@ async def _orchestrate(
         yield sse("done", {
             "reason": "max_tokens", "token_count": next_index,
             "nodes": _node_shares(provenance),
+            "cache": cache_report,
         })
         return
 
@@ -313,6 +409,7 @@ async def _orchestrate(
                 "detail": str(exc),
                 "accepted_count": next_index,
                 "prefix_text": " ".join(accepted_texts),
+                "cache": cache_report,
             })
             return
         backup_identity = (backup_info["model_id"], backup_info["tokenizer_version"])
@@ -330,14 +427,18 @@ async def _orchestrate(
                                     "tokenizer_version": backup_identity[1]},
                 "accepted_count": next_index,
                 "prefix_text": " ".join(accepted_texts),
+                "cache": cache_report,
             })
             return
 
         # ---- backup continuation with the shared token budget -------------
+        # Same complete input as the primary attempt; the backup checks its
+        # own cache slot independently.
         remaining = max_tokens - next_index
         backup_payload = {
             "request_id": request_id,
             "prompt": prompt,
+            "context": context,
             "start": next_index,
             "max_tokens": remaining,
             "accepted_ids": accepted_ids,
@@ -353,7 +454,11 @@ async def _orchestrate(
                     backup_failed = f"http_{resp.status_code}:{detail[:200]!r}"
                 else:
                     async for event, data in iter_sse_events(resp):
-                        if event == "token":
+                        if event == "meta":
+                            cache_event = note_cache_event(json.loads(data), cfg.backup_name)
+                            if cache_event is not None:
+                                yield sse("cache", cache_event)
+                        elif event == "token":
                             obj = json.loads(data)
                             if accept_token(obj, cfg.backup_name):
                                 yield sse("token", {**obj, "node": cfg.backup_name})
@@ -374,6 +479,7 @@ async def _orchestrate(
             "detail": backup_failed,
             "accepted_count": next_index,
             "prefix_text": " ".join(accepted_texts),
+            "cache": cache_report,
         })
         return
 
@@ -382,6 +488,7 @@ async def _orchestrate(
         "token_count": next_index,
         "nodes": _node_shares(provenance),
         "identical_to_healthy": True,
+        "cache": cache_report,
     })
 
 

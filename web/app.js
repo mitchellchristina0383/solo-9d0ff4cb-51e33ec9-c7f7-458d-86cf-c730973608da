@@ -1,17 +1,27 @@
 // Browser-side SSE client for the failover gateway.
 const form = document.getElementById("chat-form");
+const contextInput = document.getElementById("context");
 const promptInput = document.getElementById("prompt");
 const maxTokensInput = document.getElementById("max-tokens");
 const scenarioSelect = document.getElementById("scenario");
 const runBtn = document.getElementById("run-btn");
+const preheatBtn = document.getElementById("preheat-btn");
+const cacheStatusEl = document.getElementById("cache-status");
 const statusEl = document.getElementById("status");
 const outputEl = document.getElementById("output");
 const eventsEl = document.getElementById("events");
 const counterEl = document.getElementById("counter");
 const sharesEl = document.getElementById("shares");
+const cacheHitsEl = document.getElementById("cache-hits");
 const verificationEl = document.getElementById("verification");
 
 let expected = null;
+
+// The complete input: common context + this question. The gateway joins them
+// the same way; /api/expected must be queried with the joined text.
+function fullPrompt() {
+  return contextInput.value + promptInput.value;
+}
 
 async function loadScenarios() {
   const resp = await fetch("/api/scenarios");
@@ -22,6 +32,53 @@ async function loadScenarios() {
     opt.value = s.id;
     opt.textContent = s.id;
     scenarioSelect.appendChild(opt);
+  }
+}
+
+async function loadCacheStatus() {
+  try {
+    const resp = await fetch("/api/cache");
+    const data = await resp.json();
+    const parts = Object.entries(data.nodes).map(([node, info]) => {
+      if (!info || info.ok === false) return `${node}: 不可达`;
+      if (!info.cached) return `${node}: 空`;
+      const st = info.stats || {};
+      return `${node}: 已缓存 ${info.context_len} 字符 (state=${info.state_prefix}…, ` +
+        `命中${st.hits ?? 0}/重算${st.misses ?? 0})`;
+    });
+    cacheStatusEl.textContent = `节点缓存：${parts.join("；")}`;
+  } catch (err) {
+    cacheStatusEl.textContent = `缓存状态查询失败：${err.message}`;
+  }
+}
+
+async function preheat() {
+  const context = contextInput.value;
+  if (!context) {
+    addEvent("warn", "⛔ 请先填写公共上下文再预热");
+    return;
+  }
+  preheatBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/preheat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ context }),
+    });
+    const data = await resp.json();
+    for (const [node, r] of Object.entries(data.results)) {
+      if (r.ok) {
+        const extra = r.replaced ? "（替换了上一段上下文）" : r.refreshed ? "（刷新同一段上下文）" : "";
+        addEvent("ok", `🔥 ${node} 预热完成：${r.context_len} 字符，state=${r.state_prefix}…${extra}`);
+      } else {
+        addEvent("warn", `⛔ ${node} 预热失败：${r.error}`);
+      }
+    }
+    await loadCacheStatus();
+  } catch (err) {
+    addEvent("warn", `⛔ 预热请求失败：${err.message}`);
+  } finally {
+    preheatBtn.disabled = false;
   }
 }
 
@@ -68,10 +125,25 @@ function renderShares(nodes) {
     .map(([node, n]) => `${node}=${n}`).join("，")}`;
 }
 
+// Per-participating-node cache chips, driven by the gateway's `cache` events
+// (one per node that actually joined the generation).
+const cacheChips = new Map();
+function renderCacheChip(obj) {
+  let chip = cacheChips.get(obj.node);
+  if (!chip) {
+    chip = document.createElement("span");
+    cacheChips.set(obj.node, chip);
+    cacheHitsEl.appendChild(chip);
+  }
+  chip.className = `cache-chip ${obj.cache_hit ? "hit" : "miss"}`;
+  chip.textContent = `${obj.node}：${obj.cache_hit ? "缓存命中" : "未命中·按原文重算"}`;
+  chip.title = `上下文 ${obj.context_len} 字符，state=${obj.context_state || "—"}`;
+}
+
 async function verifyAgainstHealthy(tokens, incomplete) {
   if (!expected) {
     const resp = await fetch(
-      `/api/expected?prompt=${encodeURIComponent(promptInput.value)}&max_tokens=${maxTokensInput.value}`
+      `/api/expected?prompt=${encodeURIComponent(fullPrompt())}&max_tokens=${maxTokensInput.value}`
     );
     expected = await resp.json();
   }
@@ -134,6 +206,8 @@ async function run() {
   outputEl.innerHTML = '<span class="placeholder">（回复将在这里逐词元出现）</span>';
   eventsEl.innerHTML = "";
   sharesEl.textContent = "";
+  cacheHitsEl.innerHTML = "";
+  cacheChips.clear();
   verificationEl.className = "verification hidden";
   verificationEl.innerHTML = "";
   counterEl.textContent = "已采纳词元：0";
@@ -143,6 +217,7 @@ async function run() {
   let incomplete = false;
 
   const req = {
+    context: contextInput.value,
     prompt: promptInput.value,
     max_tokens: parseInt(maxTokensInput.value, 10),
     scenario: scenarioSelect.value,
@@ -162,7 +237,12 @@ async function run() {
       const obj = JSON.parse(data);
       switch (event) {
         case "meta":
-          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>，词元上限=${obj.max_tokens}`);
+          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>，词元上限=${obj.max_tokens}` +
+            (obj.context_len ? `，公共上下文=${obj.context_len} 字符` : "（无公共上下文）"));
+          break;
+        case "cache":
+          renderCacheChip(obj);
+          addEvent("", `🗄 ${obj.node}：${obj.cache_hit ? "上下文缓存命中，复用预热结果" : "缓存未命中，按原文重算上下文"}`);
           break;
         case "token":
           appendToken(obj);
@@ -187,6 +267,7 @@ async function run() {
 
     setStatus(incomplete ? "incomplete" : "done", incomplete ? "未完成" : "完成");
     await verifyAgainstHealthy(tokens, incomplete);
+    await loadCacheStatus();
   } catch (err) {
     setStatus("incomplete", "请求失败");
     addEvent("warn", `⛔ ${err.message}`);
@@ -199,4 +280,6 @@ form.addEventListener("submit", (e) => {
   e.preventDefault();
   run();
 });
+preheatBtn.addEventListener("click", preheat);
 loadScenarios();
+loadCacheStatus();

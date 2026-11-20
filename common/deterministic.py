@@ -45,3 +45,20 @@ def token_text(prompt: str, index: int) -> str:
 
 def expected_token_ids(prompt: str, start: int, end: int) -> list[int]:
     return [token_id(prompt, i) for i in range(start, end)]
+
+
+def context_state(context: str) -> str:
+    """Stand-in for the prefill/KV computation over a shared context.
+
+    A real engine would run the prompt-prefix through the model once and keep
+    the resulting KV blocks; this mock folds the context into a digest. The
+    digest is a pure function of the context text — no clock, no randomness —
+    so recomputing it from the original text after a cache miss, replacement
+    or restart always yields exactly the same state. Generated tokens never
+    depend on this value: the cache only decides whether the (simulated)
+    context computation is reused or recomputed.
+    """
+    h = hashlib.sha256()
+    h.update(b"mock-llm/kv/v1:")
+    h.update(context.encode("utf-8"))
+    return h.hexdigest()

@@ -18,6 +18,24 @@ them), making every scenario repeatable:
   X-Mock-Fail-At
       Fail with HTTP 500 before emitting the token at this absolute index
       (used to make the backup continuation itself fail).
+
+Prefix-cache / preheat support:
+
+  POST /preheat {context}
+      Run the (simulated) context computation now and keep the result. Each
+      node keeps ONLY the most recent successful preheat: a new preheat
+      replaces the previous entry. The cache lives in process memory, so a
+      restart loses it.
+  POST /generate {prompt, context, ...}
+      The complete input is always the submitted prompt. When ``context`` is
+      non-empty and exactly matches the cached preheat entry (and really is a
+      prefix of the prompt), the cached computation is reused (cache hit);
+      otherwise the context state is recomputed from the original text at
+      request time (cache miss). Hits and misses produce byte-identical token
+      streams — the cache only decides reuse vs recompute. A generate-time
+      recompute is discarded afterwards: only /preheat fills the cache.
+  GET /cache
+      Inspect the single cache slot and the hit/miss counters.
 """
 from __future__ import annotations
 
@@ -32,7 +50,13 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from common.deterministic import expected_token_ids, load_vocab, token_id, token_text
+from common.deterministic import (
+    context_state,
+    expected_token_ids,
+    load_vocab,
+    token_id,
+    token_text,
+)
 
 logger = logging.getLogger("mocknode")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -53,8 +77,71 @@ class GenerateRequest(BaseModel):
     max_tokens: int = Field(gt=0)
     accepted_ids: list[int] = Field(default_factory=list)
     prefix_text: str = ""
+    # Shared-context prefix of the prompt, eligible for the preheat cache.
+    # The submitted prompt remains the complete, authoritative input.
+    context: str = ""
     stall_before: int | None = Field(default=None, ge=0)
     fail_at: int | None = Field(default=None, ge=0)
+
+
+class PreheatRequest(BaseModel):
+    context: str = Field(min_length=1, max_length=4000)
+
+
+class PrefixCache:
+    """Single-slot cache: only the most recent successful preheat is kept.
+
+    A new preheat atomically replaces the previous entry. The slot lives in
+    process memory only, so a restart starts empty (the next generate then
+    recomputes from the original text). Generate-time recomputes are never
+    stored here — only /preheat fills the slot.
+    """
+
+    def __init__(self) -> None:
+        self._entry: dict | None = None
+        self.stats = {"preheats": 0, "hits": 0, "misses": 0}
+
+    def store(self, context: str) -> dict:
+        state = context_state(context)
+        replaced_with = self._entry["context"] if self._entry is not None else None
+        self._entry = {"context": context, "state": state}
+        self.stats["preheats"] += 1
+        return {
+            "state": state,
+            "replaced": replaced_with is not None and replaced_with != context,
+            "refreshed": replaced_with == context,
+        }
+
+    def lookup(self, context: str, prompt: str) -> tuple[bool, str | None]:
+        """Decide reuse vs recompute for one generate request.
+
+        Returns (hit, state). On a miss the state is recomputed from the
+        original text (and deliberately NOT stored). With an empty context
+        there is nothing to cache: (False, None).
+        """
+        if not context:
+            return False, None
+        entry = self._entry
+        if (
+            entry is not None
+            and entry["context"] == context
+            and prompt.startswith(context)
+        ):
+            self.stats["hits"] += 1
+            return True, entry["state"]
+        self.stats["misses"] += 1
+        return False, context_state(context)
+
+    def describe(self) -> dict:
+        entry = self._entry
+        return {
+            "cached": entry is not None,
+            "context_len": len(entry["context"]) if entry else 0,
+            "context_preview": (entry["context"][:40] + ("…" if len(entry["context"]) > 40 else ""))
+            if entry else "",
+            "state_prefix": entry["state"][:12] if entry else None,
+            "stats": dict(self.stats),
+        }
 
 
 def sse_line(event: str, data: str) -> bytes:
@@ -73,6 +160,8 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
     # by request id. Exposed via /debug/late so tests can assert late packets
     # really happen (and that the gateway ignores them).
     late_packets: dict[str, list[dict]] = {}
+    # Single-slot prefix cache (most recent successful preheat only).
+    cache = PrefixCache()
 
     def build_info(model_override: str | None, tokenizer_override: str | None) -> dict:
         vocab = load_vocab()
@@ -96,6 +185,28 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
     async def debug_late():
         return late_packets
 
+    @app.post("/preheat")
+    async def preheat(body: PreheatRequest):
+        """Compute the context state now and keep it (replacing any previous
+        entry). Only the most recent successful preheat is retained."""
+        result = cache.store(body.context)
+        logger.info(
+            "%s preheated context (%d chars, state=%s…, replaced=%s)",
+            cfg.node_id, len(body.context), result["state"][:12], result["replaced"],
+        )
+        return {
+            "node_id": cfg.node_id,
+            "cached": True,
+            "context_len": len(body.context),
+            "state_prefix": result["state"][:12],
+            "replaced": result["replaced"],
+            "refreshed": result["refreshed"],
+        }
+
+    @app.get("/cache")
+    async def cache_status():
+        return {"node_id": cfg.node_id, **cache.describe()}
+
     @app.post("/generate")
     async def generate(
         body: GenerateRequest,
@@ -113,6 +224,22 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
         )
         stall_before = body.stall_before
         stall_seconds = x_mock_stall_seconds
+
+        # 0. Prefix-cache decision, made once at submission time against the
+        #    complete input. Hit -> reuse the preheated context state; miss
+        #    (no entry, replaced by a newer preheat, restart, or the context
+        #    is not really a prefix of the prompt) -> recompute from the
+        #    original text. The token stream below is identical either way.
+        cache_hit, cache_state = cache.lookup(body.context, body.prompt)
+        if body.context:
+            logger.info(
+                "%s generate %s: context %d chars -> cache %s (state=%s…)",
+                cfg.node_id, body.request_id, len(body.context),
+                "HIT" if cache_hit else "MISS (recomputed from text)",
+                (cache_state or "")[:12],
+            )
+        node_info["cache_hit"] = cache_hit
+        node_info["context_state"] = (cache_state or "")[:12] if body.context else None
 
         # 1. Prefix verification: a continuation request must carry exactly the
         #    prefix this deterministic node would itself have produced.

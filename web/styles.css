@@ -93,3 +93,32 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .hidden { display: none; }
 .legend { color: var(--muted); font-size: 13px; padding-left: 18px; }
 .legend li { margin-bottom: 6px; }
+textarea {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  background: #101725;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+}
+textarea:focus { outline: 1px solid var(--accent); }
+button.secondary {
+  background: #243047;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+button.secondary:hover { border-color: var(--accent); }
+.cache-status { font-size: 12px; color: var(--muted); align-self: center; }
+.cache-hits { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.cache-chip {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.cache-chip.hit { color: var(--node-a); border: 1px solid rgba(126,224,168,.5); background: #14271d; }
+.cache-chip.miss { color: var(--node-b); border: 1px solid rgba(255,184,107,.5); background: #2b2117; }
